@@ -15,20 +15,27 @@
  */
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <bit>
 #include <random>
 
 #include "velox/dwio/nimble/encodings/ALPRDEncoding.h"
 #include "velox/dwio/nimble/encodings/legacy/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
+#include "velox/dwio/nimble/encodings/selection/NestedAlpSizeEstimation.h"
 #include "velox/dwio/nimble/encodings/selection/tests/RandomEncodingSelectionPolicy.h"
 
 namespace facebook::nimble {
 namespace {
 
+struct ALPRDSelectionTestAccess : ALPRDEncodingBase {
+  using ALPRDEncodingBase::calculateSerializedSize;
+  using ALPRDEncodingBase::selectAndDecompose;
+};
+
 using ReadFactors = std::vector<std::pair<EncodingType, float>>;
 
-// Counts child policy creation to keep estimation separate from child writing.
+// Counts child policy creation during selection and writing.
 template <typename T>
 class CountingManualPolicy : public ManualEncodingSelectionPolicy<T> {
  public:
@@ -157,7 +164,7 @@ using Configs = ::testing::Types<
     SelectionConfig<double, true>>;
 TYPED_TEST_SUITE(ALPRDSelectionTest, Configs);
 
-TYPED_TEST(ALPRDSelectionTest, estimationDoesNotCreateChildPolicies) {
+TYPED_TEST(ALPRDSelectionTest, alprdEstimationScoresEachChild) {
   using T = typename TestFixture::T;
   using PhysicalType = typename TestFixture::PhysicalType;
   const auto values = this->makeValues(512, 2);
@@ -168,8 +175,285 @@ TYPED_TEST(ALPRDSelectionTest, estimationDoesNotCreateChildPolicies) {
         values, Statistics<PhysicalType>::create(values), this->options_);
     ASSERT_EQ(selected.encodingType, encodingType);
     ASSERT_TRUE(selected.estimatedSize);
-    EXPECT_EQ(policy.numNestedPolicies, 0);
+    EXPECT_EQ(
+        policy.numNestedPolicies, encodingType == EncodingType::ALPRD ? 2 : 0);
   }
+}
+
+TYPED_TEST(ALPRDSelectionTest, alprdScoringUsesBoundedSample) {
+  using PhysicalType = typename TestFixture::PhysicalType;
+  const auto values = this->makeValues(4 * ALPRDEncodingBase::kSampleSize, 2);
+  const auto children =
+      ALPRDSelectionTestAccess::selectAndDecompose<PhysicalType>(
+          values, this->options_);
+  EXPECT_EQ(children.rowCount, values.size());
+  EXPECT_EQ(children.codes.size(), ALPRDEncodingBase::kSampleSize);
+  EXPECT_EQ(children.rightParts.size(), ALPRDEncodingBase::kSampleSize);
+  EXPECT_LE(children.exceptionPositions.size(), ALPRDEncodingBase::kSampleSize);
+  EXPECT_LE(children.exceptionHighParts.size(), ALPRDEncodingBase::kSampleSize);
+  EXPECT_EQ(
+      children.exceptionCount,
+      (uint64_t{children.exceptionPositions.size()} * values.size() +
+       ALPRDEncodingBase::kSampleSize - 1) /
+          ALPRDEncodingBase::kSampleSize);
+}
+
+TYPED_TEST(ALPRDSelectionTest, rootFactorDoesNotReweightChildCosts) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  const auto values = this->makeValues(512, 2);
+  const auto statistics = Statistics<PhysicalType>::create(values);
+  const auto score = [&](float rootFactor) {
+    ManualEncodingSelectionPolicy<T> policy{
+        {{EncodingType::ALPRD, rootFactor}},
+        std::nullopt,
+        std::nullopt,
+        ReadFactors{{EncodingType::FixedBitWidth, 1}}};
+    return policy.select(values, statistics, this->options_);
+  };
+  const auto factorOne = score(1);
+  const auto factorTwo = score(2);
+  ASSERT_EQ(factorOne.encodingType, EncodingType::ALPRD);
+  ASSERT_EQ(factorTwo.encodingType, EncodingType::ALPRD);
+  ASSERT_TRUE(factorOne.estimatedCost.has_value());
+  ASSERT_TRUE(factorTwo.estimatedCost.has_value());
+  EXPECT_EQ(factorTwo.estimatedSize, factorOne.estimatedSize);
+  EXPECT_DOUBLE_EQ(
+      factorTwo.estimatedCost.value(), factorOne.estimatedCost.value());
+}
+
+TYPED_TEST(ALPRDSelectionTest, constantChildHeadersAreNotScaledWithRows) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  constexpr uint32_t kNumRows = 65'536;
+  const std::vector<PhysicalType> values(
+      kNumRows, std::bit_cast<PhysicalType>(T{1.25}));
+  ManualEncodingSelectionPolicy<T> policy{
+      {{EncodingType::ALPRD, 1}},
+      std::nullopt,
+      std::nullopt,
+      ReadFactors{{EncodingType::Constant, 1}}};
+  const auto result = policy.select(
+      values, Statistics<PhysicalType>::create(values), this->options_);
+  ASSERT_EQ(result.encodingType, EncodingType::ALPRD);
+  ASSERT_TRUE(result.estimatedSize.has_value());
+  // ALPRD metadata and both Constant children remain O(1). Linear sample
+  // extrapolation would incorrectly multiply their headers by 64 here.
+  EXPECT_LT(result.estimatedSize.value(), 256);
+}
+
+TYPED_TEST(ALPRDSelectionTest, projectedChildrenUseSafeSelectedEstimator) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  constexpr uint32_t kNumRows = 65'536;
+  const auto values = this->makeValues(kNumRows, 2);
+  const auto children =
+      ALPRDSelectionTestAccess::selectAndDecompose<PhysicalType>(
+          values, this->options_);
+
+  const auto codesSize = detail::EncodingSizeEstimation<uint16_t>::estimateSize(
+      EncodingType::FixedBitWidth,
+      children.rowCount,
+      Statistics<uint16_t>::create(children.codes),
+      this->options_);
+  const auto rightPartsSize =
+      detail::EncodingSizeEstimation<PhysicalType>::estimateSize(
+          EncodingType::FixedBitWidth,
+          children.rowCount,
+          Statistics<PhysicalType>::create(children.rightParts),
+          this->options_);
+  ASSERT_FALSE(children.exceptionPositions.empty());
+  std::array<uint32_t, 2> projectedExceptionPositions{};
+  std::span<const uint32_t> exceptionPositionValues =
+      children.exceptionPositions;
+  if (children.exceptionPositions.size() < children.exceptionCount) {
+    projectedExceptionPositions = {0, children.rowCount - 1};
+    exceptionPositionValues = projectedExceptionPositions;
+  }
+  const auto exceptionPositionsSize =
+      detail::EncodingSizeEstimation<uint32_t>::estimateSize(
+          EncodingType::FixedBitWidth,
+          children.exceptionCount,
+          Statistics<uint32_t>::create(exceptionPositionValues),
+          this->options_);
+  const auto exceptionHighPartsSize =
+      detail::EncodingSizeEstimation<uint16_t>::estimateSize(
+          EncodingType::FixedBitWidth,
+          children.exceptionCount,
+          Statistics<uint16_t>::create(children.exceptionHighParts),
+          this->options_);
+  ASSERT_TRUE(codesSize.has_value());
+  ASSERT_TRUE(rightPartsSize.has_value());
+  ASSERT_TRUE(exceptionPositionsSize.has_value());
+  ASSERT_TRUE(exceptionHighPartsSize.has_value());
+  const auto expectedSize = ALPRDSelectionTestAccess::calculateSerializedSize(
+      children.parameters,
+      children.rowCount,
+      children.exceptionCount,
+      {codesSize.value(),
+       rightPartsSize.value(),
+       exceptionPositionsSize.value(),
+       exceptionHighPartsSize.value()},
+      this->options_);
+
+  ManualEncodingSelectionPolicy<T> policy{
+      {{EncodingType::ALPRD, 1}},
+      std::nullopt,
+      std::nullopt,
+      ReadFactors{{EncodingType::FixedBitWidth, 1}}};
+  const auto result = policy.select(
+      values, Statistics<PhysicalType>::create(values), this->options_);
+  ASSERT_EQ(result.encodingType, EncodingType::ALPRD);
+  EXPECT_EQ(result.estimatedSize, expectedSize);
+}
+
+TYPED_TEST(
+    ALPRDSelectionTest,
+    projectedSelectionRejectsIncompatibleCandidates) {
+  using PhysicalType = typename TestFixture::PhysicalType;
+  constexpr uint32_t kNumRows{65'536};
+  const std::array<PhysicalType, 4> values{0, 1, 2, 3};
+  const auto statistics = Statistics<PhysicalType>::create(values);
+  for (const bool withCompression : {false, true}) {
+    SCOPED_TRACE(withCompression);
+    std::optional<CompressionOptions> compressionOptions;
+    if (withCompression) {
+      compressionOptions = CompressionOptions{};
+    }
+    ManualEncodingSelectionPolicy<PhysicalType> policy{
+        ReadFactors{{EncodingType::SparseBool, 1}},
+        compressionOptions,
+        std::nullopt};
+    const auto projected =
+        policy.select(values, statistics, kNumRows, this->options_);
+    EXPECT_FALSE(projected.has_value());
+
+    const auto fullInput = policy.select(values, statistics, this->options_);
+    EXPECT_EQ(fullInput.encodingType, EncodingType::Trivial);
+    EXPECT_FALSE(fullInput.estimatedSize.has_value());
+  }
+}
+
+TYPED_TEST(ALPRDSelectionTest, skipsUnprojectableSampledChildren) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  const auto values = this->makeValues(65'536, 2);
+  for (const auto childEncoding :
+       {EncodingType::RLE,
+        EncodingType::Dictionary,
+        EncodingType::MainlyConstant,
+        EncodingType::Varint,
+        EncodingType::PFOR,
+        EncodingType::BlockBitPacking}) {
+    SCOPED_TRACE(childEncoding);
+    ManualEncodingSelectionPolicy<T> policy{
+        {{EncodingType::ALPRD, 1}},
+        std::nullopt,
+        std::nullopt,
+        ReadFactors{{childEncoding, 1}}};
+    const auto result = policy.select(
+        values, Statistics<PhysicalType>::create(values), this->options_);
+    EXPECT_EQ(result.encodingType, EncodingType::Trivial);
+  }
+}
+
+TEST(
+    ALPRDSelectionProjectionTest,
+    rejectsUnscaledFrequencyAndStringStatistics) {
+  const std::array<uint32_t, 4> numericValues{1, 1, 2, 3};
+  const auto numericStatistics = Statistics<uint32_t>::create(numericValues);
+  for (const auto encodingType :
+       {EncodingType::Dictionary, EncodingType::MainlyConstant}) {
+    const auto projected =
+        detail::EncodingSizeEstimation<uint32_t>::estimateNestedSize(
+            encodingType,
+            numericValues,
+            numericStatistics,
+            Encoding::Options{},
+            {},
+            1.0,
+            65'536);
+    ASSERT_TRUE(projected.has_value());
+    EXPECT_FALSE(projected->estimatedSize.has_value());
+    EXPECT_FALSE(projected->estimatedCost.has_value());
+    EXPECT_TRUE(
+        detail::EncodingSizeEstimation<uint32_t>::estimateSize(
+            encodingType,
+            numericValues,
+            numericStatistics,
+            Encoding::Options{}));
+  }
+
+  const std::array<std::string_view, 2> stringValues{"a", "longer"};
+  const auto projected =
+      detail::EncodingSizeEstimation<std::string_view>::estimateNestedSize(
+          EncodingType::Trivial,
+          stringValues,
+          Statistics<std::string_view>::create(stringValues),
+          Encoding::Options{},
+          {},
+          1.0,
+          65'536);
+  ASSERT_TRUE(projected.has_value());
+  EXPECT_FALSE(projected->estimatedSize.has_value());
+  EXPECT_FALSE(projected->estimatedCost.has_value());
+}
+
+TYPED_TEST(ALPRDSelectionTest, unsupportedProjectionSkipsChildEstimation) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  const auto values = this->makeValues(512, 2);
+  uint32_t numChildEstimates{0};
+  const auto result = detail::EncodingSizeEstimation<T>::estimateNestedSize(
+      EncodingType::ALPRD,
+      values,
+      Statistics<PhysicalType>::create(values),
+      this->options_,
+      {},
+      1.0,
+      65'536,
+      [&]<typename NestedT>(
+          EncodingType,
+          NestedEncodingIdentifier,
+          std::span<const NestedT>,
+          uint32_t,
+          const Encoding::Options&) -> std::optional<EncodingSelectionResult> {
+        ++numChildEstimates;
+        return std::nullopt;
+      });
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(result->estimatedSize.has_value());
+  EXPECT_FALSE(result->estimatedCost.has_value());
+  EXPECT_EQ(numChildEstimates, 0);
+}
+
+TYPED_TEST(
+    ALPRDSelectionTest,
+    projectedSelectionSkipsUnsupportedCandidateBeforeChoosing) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  const auto values = this->makeValues(65'536, 2);
+  ManualEncodingSelectionPolicy<T> policy{
+      {{EncodingType::ALPRD, 1}},
+      std::nullopt,
+      std::nullopt,
+      ReadFactors{
+          {EncodingType::RLE, 0.000001}, {EncodingType::FixedBitWidth, 1}}};
+  const auto result = policy.select(
+      values, Statistics<PhysicalType>::create(values), this->options_);
+  EXPECT_EQ(result.encodingType, EncodingType::ALPRD);
+}
+
+TEST(ALPRDSelectionProjectionTest, fullInputSelectionStillUsesRle) {
+  std::vector<uint32_t> values(1'024, 1);
+  std::fill(values.begin() + 512, values.end(), 2);
+  ManualEncodingSelectionPolicy<uint32_t> policy{
+      ReadFactors{{EncodingType::RLE, 1}, {EncodingType::Trivial, 1}},
+      std::nullopt,
+      std::nullopt};
+  const auto result = policy.select(
+      values, Statistics<uint32_t>::create(values), Encoding::Options{});
+  EXPECT_EQ(result.encodingType, EncodingType::RLE);
 }
 
 TYPED_TEST(ALPRDSelectionTest, writingCreatesOnePolicyPerChild) {
@@ -266,6 +550,104 @@ TYPED_TEST(ALPRDSelectionTest, projectsOneSampleExceptionToDistinctPositions) {
   this->check(encoded, sample);
 }
 
+TYPED_TEST(
+    ALPRDSelectionTest,
+    projectedExceptionChildrenRespectValueSemantics) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  constexpr uint32_t kNumRows = 65'536;
+  constexpr uint8_t kRightBits = sizeof(T) * 8 - 16;
+  constexpr PhysicalType kMask = (PhysicalType{1} << kRightBits) - 1;
+  std::vector<PhysicalType> values(kNumRows);
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    values[i] = (PhysicalType{0x3f00} << kRightBits) | (i % 2 == 0 ? 0 : kMask);
+  }
+  const auto sampledException =
+      detail::NestedAlpSizeEstimation::sampledRowIndex(
+          3, ALPRDEncodingBase::kSampleSize, kNumRows);
+  values[sampledException] = (PhysicalType{0xff00} << kRightBits) | kMask;
+  std::array<EncodingType, 4> selectedEncodings{};
+  const auto result = ALPRDEncoding<T>::estimateSize(
+      values,
+      this->options_,
+      [&]<typename NestedT>(
+          EncodingType /*parentEncodingType*/,
+          NestedEncodingIdentifier identifier,
+          std::span<const NestedT> nestedSampleValues,
+          uint32_t numTargetValues,
+          const Encoding::Options& options) {
+        ManualEncodingSelectionPolicy<NestedT> policy{
+            {{EncodingType::Constant, 1}, {EncodingType::FixedBitWidth, 1}},
+            std::nullopt,
+            identifier};
+        auto selected = policy.select(
+            nestedSampleValues,
+            Statistics<NestedT>::create(nestedSampleValues),
+            numTargetValues,
+            options);
+        if (selected.has_value()) {
+          selectedEncodings[identifier] = selected->encodingType;
+        }
+        return selected;
+      });
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(
+      selectedEncodings[EncodingIdentifiers::ALPRD::ExceptionPositions],
+      EncodingType::FixedBitWidth);
+  EXPECT_EQ(
+      selectedEncodings[EncodingIdentifiers::ALPRD::ExceptionHighParts],
+      EncodingType::Constant);
+}
+
+TYPED_TEST(ALPRDSelectionTest, projectedExceptionPositionsUseFullRowRange) {
+  using T = typename TestFixture::T;
+  using PhysicalType = typename TestFixture::PhysicalType;
+  constexpr uint32_t kNumRows = 65'536;
+  constexpr uint8_t kRightBits = sizeof(T) * 8 - 16;
+  constexpr PhysicalType kMask = (PhysicalType{1} << kRightBits) - 1;
+
+  const auto makeValues = [&](std::array<uint32_t, 3> sampleIndexes) {
+    std::vector<PhysicalType> values(kNumRows);
+    for (uint32_t i = 0; i < values.size(); ++i) {
+      values[i] =
+          (PhysicalType{0x3f00} << kRightBits) | (i % 2 == 0 ? 0 : kMask);
+    }
+    for (const auto sampleIndex : sampleIndexes) {
+      const auto row = detail::NestedAlpSizeEstimation::sampledRowIndex(
+          sampleIndex, ALPRDEncodingBase::kSampleSize, kNumRows);
+      values[row] = (PhysicalType{0xff00} << kRightBits) | kMask;
+    }
+    return values;
+  };
+  const auto score = [&](const std::vector<PhysicalType>& values) {
+    ManualEncodingSelectionPolicy<T> policy{
+        {{EncodingType::ALPRD, 1}},
+        CompressionOptions{},
+        std::nullopt,
+        ReadFactors{
+            {EncodingType::Constant, 1}, {EncodingType::FixedBitWidth, 1}}};
+    return policy.select(
+        values, Statistics<PhysicalType>::create(values), this->options_);
+  };
+
+  const auto clustered = makeValues({1, 2, 3});
+  const auto dispersed = makeValues({1, 512, 1'022});
+  const auto clusteredChildren =
+      ALPRDSelectionTestAccess::selectAndDecompose<PhysicalType>(
+          clustered, this->options_);
+  ASSERT_EQ(clusteredChildren.exceptionPositions.size(), 3);
+  ASSERT_GT(
+      clusteredChildren.exceptionCount,
+      clusteredChildren.exceptionPositions.size());
+
+  const auto clusteredScore = score(clustered);
+  const auto dispersedScore = score(dispersed);
+  ASSERT_EQ(clusteredScore.encodingType, EncodingType::ALPRD);
+  ASSERT_EQ(dispersedScore.encodingType, EncodingType::ALPRD);
+  EXPECT_EQ(clusteredScore.estimatedSize, dispersedScore.estimatedSize);
+  EXPECT_EQ(clusteredScore.estimatedCost, dispersedScore.estimatedCost);
+}
+
 TYPED_TEST(ALPRDSelectionTest, constantAndTargetRowBoundaries) {
   using T = typename TestFixture::T;
   using PhysicalType = typename TestFixture::PhysicalType;
@@ -305,14 +687,19 @@ TYPED_TEST(ALPRDSelectionTest, selectsBySizeAndReadFactor) {
   EXPECT_EQ(EncodingPrefix::encodingType(encoded), EncodingType::ALPRD);
   this->check(encoded, values);
 
-  auto penalized = candidates();
-  penalized.back().second = 10;
+  auto favorTrivial = candidates();
+  const auto trivial = std::find_if(
+      favorTrivial.begin(), favorTrivial.end(), [](const auto& entry) {
+        return entry.first == EncodingType::Trivial;
+      });
+  ASSERT_NE(trivial, favorTrivial.end());
+  trivial->second = 0.01;
   EXPECT_NE(
-      this->select(values, penalized, std::nullopt).encodingType,
+      this->select(values, favorTrivial, std::nullopt).encodingType,
       EncodingType::ALPRD);
-  penalized.pop_back();
+  favorTrivial.pop_back();
   EXPECT_NE(
-      this->select(values, penalized, std::nullopt).encodingType,
+      this->select(values, favorTrivial, std::nullopt).encodingType,
       EncodingType::ALPRD);
 }
 
@@ -339,7 +726,7 @@ TYPED_TEST(ALPRDSelectionTest, keepsBetterExistingCandidates) {
   }
 }
 
-TYPED_TEST(ALPRDSelectionTest, estimatesIndependentlyOfWriterCandidates) {
+TYPED_TEST(ALPRDSelectionTest, estimatesSelectedChildEncodings) {
   const auto values = this->makeValues(512, 2);
   const auto packed = this->select(
       values,
@@ -351,12 +738,22 @@ TYPED_TEST(ALPRDSelectionTest, estimatesIndependentlyOfWriterCandidates) {
       ReadFactors{{EncodingType::Trivial, 1}});
   ASSERT_TRUE(packed.estimatedSize);
   ASSERT_TRUE(trivial.estimatedSize);
-  EXPECT_EQ(*packed.estimatedSize, *trivial.estimatedSize);
+  EXPECT_LT(*packed.estimatedSize, *trivial.estimatedSize);
   std::optional<ALPRDEncodingBase::Parameters> trained;
+  std::optional<uint64_t> packedSize;
+  std::optional<uint64_t> trivialSize;
   for (auto child : {EncodingType::FixedBitWidth, EncodingType::Trivial}) {
     const auto encoded = this->encode(
         values,
         this->policy({{EncodingType::ALPRD, 1}}, ReadFactors{{child, 1}}));
+    // Generic child estimators deliberately approximate serialization prefix
+    // sizes. Validate that their ranking follows the actual complete trees,
+    // rather than requiring a byte-exact estimate.
+    if (child == EncodingType::FixedBitWidth) {
+      packedSize = encoded.size();
+    } else {
+      trivialSize = encoded.size();
+    }
     const auto layout = EncodingLayoutCapture::capture(encoded, this->options_);
     EXPECT_EQ(layout.encodingType(), EncodingType::ALPRD);
     EXPECT_EQ(layout.child(0)->encodingType(), child);
@@ -372,6 +769,9 @@ TYPED_TEST(ALPRDSelectionTest, estimatesIndependentlyOfWriterCandidates) {
     }
     this->check(encoded, values);
   }
+  ASSERT_TRUE(packedSize.has_value());
+  ASSERT_TRUE(trivialSize.has_value());
+  EXPECT_LT(packedSize.value(), trivialSize.value());
 }
 
 TYPED_TEST(ALPRDSelectionTest, dictionaryEstimateUsesConfiguredFloatAlphabet) {
@@ -619,6 +1019,7 @@ TYPED_TEST(ALPRDSelectionTest, selectsNestedFloatingPointValues) {
         EncodingType::MainlyConstant}) {
     SCOPED_TRACE(parent);
     std::vector<typename TestFixture::PhysicalType> values;
+    values.reserve(4'096);
     for (uint32_t i = 0; i < 4'096; ++i) {
       values.push_back(
           parent == EncodingType::MainlyConstant
@@ -826,7 +1227,10 @@ TYPED_TEST(ALPRDSelectionTest, replaySelectsAlpCodecsForUnspecifiedValues) {
           std::nullopt,
           [child](DataType type) {
             return ManualEncodingSelectionPolicyFactory{
-                {{EncodingType::Trivial, 1}, {child, 0.001}}, std::nullopt}
+                {{EncodingType::Trivial, 1'000'000}, {child, 1}},
+                std::nullopt,
+                ManualEncodingSelectionPolicyFactory::
+                    defaultEncodingReadFactors()}
                 .createPolicy(type);
           });
       const auto encoded = EncodingFactory::encodeNullable<T>(

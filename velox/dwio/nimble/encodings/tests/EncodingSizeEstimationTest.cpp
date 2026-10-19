@@ -16,6 +16,8 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>
+#include <optional>
+#include <span>
 #include <string>
 
 #include "velox/dwio/nimble/common/Types.h"
@@ -32,6 +34,7 @@
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/VarintEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
+#include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/memory/Memory.h"
@@ -210,6 +213,78 @@ class EncodingSizeEstimationTest : public ::testing::Test {
   const Encoding::Options defaultOptions_;
 };
 
+TEST_F(EncodingSizeEstimationTest, ordinaryEncodingsKeepSizeBasedScores) {
+  const auto verify = [&]<typename T>(
+                          std::span<const T> data,
+                          std::span<const EncodingType> candidates) {
+    using physicalType = typename TypeTraits<T>::physicalType;
+    using Est = detail::EncodingSizeEstimation<T>;
+    SCOPED_TRACE(toString(TypeTraits<T>::dataType));
+    const auto values =
+        EncodingPhysicalType<T>::asEncodingPhysicalTypeSpan(data);
+    const auto statistics = Statistics<physicalType>::create(values);
+    bool scoredChildren{false};
+    const auto scoreNestedChild =
+        [&](auto&&...) -> std::optional<EncodingSelectionResult> {
+      scoredChildren = true;
+      return std::nullopt;
+    };
+
+    for (const auto encodingType : candidates) {
+      SCOPED_TRACE(toString(encodingType));
+      const auto estimatedSize =
+          Est::estimateSize(encodingType, values, statistics, defaultOptions_);
+      ASSERT_TRUE(estimatedSize.has_value());
+      for (const double costFactor : {0.5, 3.0}) {
+        SCOPED_TRACE(costFactor);
+        const auto score = Est::estimateNestedSize(
+            encodingType,
+            values,
+            statistics,
+            defaultOptions_,
+            {},
+            costFactor,
+            values.size(),
+            scoreNestedChild);
+        ASSERT_TRUE(score.has_value());
+        EXPECT_EQ(score->encodingType, encodingType);
+        EXPECT_EQ(score->estimatedSize, estimatedSize);
+        ASSERT_TRUE(score->estimatedCost.has_value());
+        EXPECT_DOUBLE_EQ(
+            score->estimatedCost.value(),
+            static_cast<double>(estimatedSize.value()) * costFactor);
+      }
+    }
+    EXPECT_FALSE(scoredChildren);
+  };
+
+  const std::array<uint32_t, 6> numericData = {100, 101, 101, 104, 104, 104};
+  const std::array numericCandidates = {
+      EncodingType::Trivial,
+      EncodingType::FixedBitWidth,
+      EncodingType::Dictionary,
+      EncodingType::RLE,
+      EncodingType::MainlyConstant,
+      EncodingType::Varint};
+  verify(std::span<const uint32_t>{numericData}, numericCandidates);
+
+  const std::array<bool, 4> boolData = {true, true, false, true};
+  const std::array boolCandidates = {
+      EncodingType::Trivial, EncodingType::RLE, EncodingType::SparseBool};
+  verify(std::span<const bool>{boolData}, boolCandidates);
+
+  const std::array<std::string_view, 4> stringData = {"a", "a", "bbb", "a"};
+  const std::array stringCandidates = {
+      EncodingType::Trivial, EncodingType::Dictionary, EncodingType::RLE};
+  verify(std::span<const std::string_view>{stringData}, stringCandidates);
+
+  const std::array trivialCandidate = {EncodingType::Trivial};
+  const std::array<float, 3> floatData = {1.0f, 2.0f, 3.0f};
+  verify(std::span<const float>{floatData}, trivialCandidate);
+  const std::array<double, 3> doubleData = {1.0, 2.0, 3.0};
+  verify(std::span<const double>{doubleData}, trivialCandidate);
+}
+
 TEST_F(EncodingSizeEstimationTest, numericConstant) {
   using Est = detail::EncodingSizeEstimation<uint32_t>;
 
@@ -232,6 +307,42 @@ TEST_F(EncodingSizeEstimationTest, numericConstantNonConstantData) {
   auto size =
       Est::estimateSize(EncodingType::Constant, 3, stats, defaultOptions_);
   EXPECT_FALSE(size.has_value());
+}
+
+TEST_F(EncodingSizeEstimationTest, constantProjectionUsesTargetRowPrefix) {
+  const std::array<uint32_t, 3> values{42, 42, 42};
+  const auto statistics = Statistics<uint32_t>::create(values);
+  constexpr double kCostFactor{3.0};
+  for (const bool useVarintRowCount : {false, true}) {
+    SCOPED_TRACE(useVarintRowCount);
+    Encoding::Options options;
+    options.useVarintRowCount = useVarintRowCount;
+    for (const uint32_t numTargetValues : {127u, 128u, 16'383u, 16'384u}) {
+      SCOPED_TRACE(numTargetValues);
+      const auto projected =
+          detail::EncodingSizeEstimation<uint32_t>::estimateNestedSize(
+              EncodingType::Constant,
+              values,
+              statistics,
+              options,
+              {},
+              kCostFactor,
+              numTargetValues);
+      const auto countSize =
+          detail::EncodingSizeEstimation<uint32_t>::estimateSize(
+              EncodingType::Constant, numTargetValues, statistics, options);
+      ASSERT_TRUE(projected.has_value());
+      ASSERT_TRUE(countSize.has_value());
+      const uint64_t expectedSize =
+          EncodingPrefix::serializedSize(numTargetValues, useVarintRowCount) +
+          sizeof(uint32_t);
+      EXPECT_EQ(projected->estimatedSize, expectedSize);
+      EXPECT_EQ(countSize, expectedSize);
+      ASSERT_TRUE(projected->estimatedCost.has_value());
+      EXPECT_DOUBLE_EQ(
+          projected->estimatedCost.value(), expectedSize * kCostFactor);
+    }
+  }
 }
 
 TEST_F(EncodingSizeEstimationTest, numericTrivial) {

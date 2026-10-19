@@ -16,8 +16,10 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <cstddef>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include "velox/dwio/nimble/common/Exceptions.h"
 #include "velox/dwio/nimble/common/Types.h"
@@ -43,13 +45,77 @@ namespace facebook::nimble {
 
 namespace detail {
 
-/// Estimates encoded data size for encoding selection. Estimates are heuristic
-/// and are not expected to match the serialized size exactly.
+/// Estimates encoded size and policy cost for encoding selection. Size
+/// estimates are heuristic and need not match the serialized size exactly.
 template <typename T>
 struct EncodingSizeEstimation {
   using physicalType = typename TypeTraits<T>::physicalType;
 
-  /// Estimates size from statistics over the full input.
+  /// Estimates size and policy cost for the sample projected to numTargetValues
+  /// rows. Unsupported projection returns a result without size or cost;
+  /// otherwise, returns nullopt if the encoding cannot estimate the input.
+  template <typename NestedChildSizeEstimator = std::nullptr_t>
+  static std::optional<EncodingSelectionResult> estimateNestedSize(
+      EncodingType parentEncodingType,
+      std::span<const physicalType> sampledValues,
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options,
+      std::span<const std::pair<EncodingType, float>> nestedEncodingReadFactors,
+      double costFactor,
+      size_t numTargetValues,
+      NestedChildSizeEstimator&& estimateNestedChildSize = nullptr) {
+    NIMBLE_CHECK_LE(sampledValues.size(), numTargetValues);
+    const bool needsProjection = numTargetValues != sampledValues.size();
+    std::optional<uint64_t> estimatedSize;
+    if (needsProjection) {
+      // Only these encodings support estimating target rows from sample
+      // statistics.
+      const bool canProject = parentEncodingType == EncodingType::Constant ||
+          (parentEncodingType == EncodingType::Trivial &&
+           !isStringType<physicalType>()) ||
+          parentEncodingType == EncodingType::FixedBitWidth ||
+          parentEncodingType == EncodingType::SimdForBitpack;
+      if (!canProject) {
+        return EncodingSelectionResult{.encodingType = parentEncodingType};
+      }
+
+      estimatedSize = estimateSize(
+          parentEncodingType,
+          numTargetValues,
+          statistics,
+          options,
+          nestedEncodingReadFactors);
+    } else {
+      if constexpr (
+          isFloatingPointType<T>() &&
+          !std::is_same_v<NestedChildSizeEstimator, std::nullptr_t>) {
+        if (parentEncodingType == EncodingType::ALPRD) {
+          return ALPRDEncoding<T>::estimateSize(
+              sampledValues,
+              options,
+              std::forward<NestedChildSizeEstimator>(estimateNestedChildSize));
+        }
+      }
+
+      // All target rows are available; estimate them directly.
+      estimatedSize = estimateSize(
+          parentEncodingType,
+          sampledValues,
+          statistics,
+          options,
+          nestedEncodingReadFactors);
+    }
+    if (!estimatedSize) {
+      return std::nullopt;
+    }
+    return EncodingSelectionResult{
+        .encodingType = parentEncodingType,
+        .estimatedSize = estimatedSize,
+        .estimatedCost = static_cast<double>(*estimatedSize) * costFactor,
+    };
+  }
+
+  /// Estimates size from the target row count and the relevant statistics.
   static std::optional<uint64_t> estimateSize(
       const EncodingType encodingType,
       const size_t entryCount,
@@ -105,7 +171,8 @@ struct EncodingSizeEstimation {
           nestedEncodingReadFactors) {
     switch (encodingType) {
       case EncodingType::Constant: {
-        return std::nullopt;
+        return ConstantEncoding<T>::estimateSize(
+            entryCount, statistics, options);
       }
       case EncodingType::MainlyConstant: {
         // TODO: Wire per-block tightening when BlockBitPacking is a
@@ -240,7 +307,8 @@ struct EncodingSizeEstimation {
       const Encoding::Options& options) {
     switch (encodingType) {
       case EncodingType::Constant: {
-        return std::nullopt;
+        return ConstantEncoding<bool>::estimateSize(
+            entryCount, statistics, options);
       }
       case EncodingType::SparseBool: {
         return SparseBoolEncoding::estimateSize(
@@ -282,7 +350,8 @@ struct EncodingSizeEstimation {
       const Encoding::Options& options) {
     switch (encodingType) {
       case EncodingType::Constant: {
-        return std::nullopt;
+        return ConstantEncoding<std::string_view>::estimateSize(
+            entryCount, statistics, options);
       }
       case EncodingType::MainlyConstant: {
         return MainlyConstantEncoding<std::string_view>::estimateSize(

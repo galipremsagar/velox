@@ -18,9 +18,10 @@ slices, and a FLOAT/DOUBLE encoding view.
 
 To enable automatic selection, add `ALPRD=<readFactor>` to the manual policy's
 candidate configuration. ALP_RD is absent from production default candidates.
-ALP and ALP_RD compete with all eligible encodings at the same selection node
-using `estimatedSize * readFactor`; there is no dedicated ALP-failure fallback
-or special mutual exclusion. A lower factor favors an encoding. A size win
+ALP competes using its estimated size and read factor. ALP_RD uses the
+nested-tree cost described below. Both compete with
+other eligible encodings at the same selection node; there is no dedicated
+ALP-failure fallback or special mutual exclusion. Lower cost wins. A size win
 alone does not establish a decoding-speed win.
 
 The encoding applies to one Nimble encoding payload. Each payload has its own
@@ -146,12 +147,10 @@ input. It evaluates high-part widths from 1 through 16. At each width it counts
 high-prefix frequencies and tries dictionaries containing one through eight
 of the most frequent prefixes, bounded by the number of distinct prefixes.
 
-Each split is scored using fixed scalar child-size heuristics. All modeled
-codecs are enabled by Nimble's default manual policy: Constant, FixedBitWidth
-and Trivial. The cost model does not create child policies or invoke selection,
-and it does not encode candidate payloads. Split selection needs only the
-bounded input sample, prefix frequencies and value ranges; it does not build
-four candidate child arrays.
+Split training uses fixed scalar child-size heuristics. This first stage chooses
+only the right-bit width and high-part dictionary; it does not choose the child
+encodings used by the writer. Split training needs only the bounded input
+sample, prefix frequencies and value ranges.
 
 | Child | Heuristic |
 | --- | --- |
@@ -167,8 +166,9 @@ position. Using the full row range is conservative when exceptions cluster.
 Nimble's Varint encodes offsets from the minimum value rather than gaps between
 successive positions. It also requires 32- or 64-bit values, whereas codes and
 exception high parts are uint16. The fixed model therefore uses the three
-scalar codecs above; actual child selection can still choose other configured
-encodings.
+scalar codecs above. After the split is selected, automatic root scoring
+consults the configured nested policy and can choose other eligible encodings
+with supported sample projection for each child.
 
 FixedBitWidth uses the caller's `fixedBitWidthUseExactBits` option. By default,
 widths round up to whole bytes: two dictionary entries therefore cost about
@@ -176,11 +176,12 @@ one byte per code, not one bit. Trivial limits the estimate when the packed
 width approaches the physical integer width. Equal split costs prefer narrower
 right parts, then smaller dictionaries.
 
-### Size estimation from samples
+### Automatic root scoring from samples
 
-The same bounded split search supplies both ALP_RD's automatic size estimate
-and its writer parameters. Let `N` be the target row count, `M` the number of
-sampled values, and `e` the number of sampled dictionary misses. The projected
+After choosing the split, automatic selection decomposes at most 1,024
+representative values into Codes, RightParts, ExceptionPositions and
+ExceptionHighParts. Let `N` be the target row count, `M` the number of sampled
+values, and `e` the number of sampled dictionary misses. The projected
 exception count is:
 
 ```text
@@ -188,23 +189,24 @@ E = ceil(e * N / M)
 ```
 
 Codes and right parts each represent `N` values. The two exception streams each
-represent `E` values and are omitted when `E == 0`. For a non-empty child with
-estimated range `[minValue, maxValue]`, the shared scalar model is:
+represent `E` values and are omitted when `E == 0`. Each non-empty sample is
+passed to its nested selection policy with the target child row count. The
+policy returns the selected encoding's projected size and cost weighted by its
+read factor.
 
-```text
-if minValue == maxValue:
-    childSize = prefixSize(childRows) + sizeof(childType)
-else:
-    childSize = min(
-        FixedBitWidth::estimateSize(childRows, minValue, maxValue, options),
-        Trivial::estimateSize(childRows))
-```
+For projected streams, the policy considers only candidates with supported
+projection: numeric Trivial, FixedBitWidth, SimdForBitpack and Constant. Fixed
+headers are counted once; Constant retains its value and replaces only the
+row-count prefix. If none of the configured candidates yields a projected
+score, ALP_RD is skipped for automatic selection. An empty child candidate list
+uses the ordinary Trivial fallback. Unsupported encodings remain available
+when the writer selects on full child data.
 
-The existing child estimators receive the target child row count directly.
-Their headers are counted once, not multiplied by the sampling ratio. They
-retain Nimble's existing approximate size convention, including the fixed
-prefix used by FixedBitWidth and Trivial estimates. ALP_RD does not convert
-those estimates to exact serialized bytes or add codec-specific padding.
+Exception positions are distinct absolute rows. When sampled exceptions are
+projected to additional rows, scoring uses the complete `[0, N - 1]` range so
+clustered sampled positions do not understate the position width. Exception
+high parts retain their observed value distribution because equal high parts
+are valid.
 
 ALP_RD then adds its own format overhead once:
 
@@ -217,10 +219,10 @@ estimatedSize = prefixSize(N)
 ```
 
 `prefixSize` follows `useVarintRowCount`. Child-length fields and the exception
-count always use varints. The result is a heuristic byte estimate for comparing
-ALP_RD with other candidates through the ordinary policy's
-`estimatedSize * readFactor` rule. It is not an exact prediction of serialized
-size. Sampling may miss rare values, and generic compression is not predicted.
+count always use varints. The root cost is the independently weighted child
+costs plus ALP_RD's container overhead in bytes. ALP_RD's root read factor does
+not affect this cost. Sampling may miss rare values, so the result remains a
+heuristic.
 
 ALP uses the same scalar child-cost helpers in `NestedAlpSizeEstimation` for its
 transformed integers, exception positions and original exception values. It
@@ -230,17 +232,14 @@ encoding estimators keep their existing contracts.
 
 ### Writing the selected split
 
-The writer trains with the same policy-independent model, transforms the full
-input into child arrays, and passes each array to the existing `encodeNested()`
-path. Child policies then apply their configured candidates, read factors,
-ancestor filters and replayed layouts to the actual child data.
-
-Consequently, changing a child policy does not change the split model, but it
-can change the written child encodings and payload size. The model can be less
-accurate under custom candidates or weights. This is the same separation of
-heuristic parent estimation and actual child selection used by existing Nimble
-containers. Dictionary, RLE and MainlyConstant retain their existing parent
-estimators; they do not recursively simulate an ALP_RD subtree during estimation.
+The writer trains the split with the same bounded scalar model, transforms the
+full input into child arrays, and passes each array to the existing
+`encodeNested()` path. Child policies then apply their configured candidates,
+read factors, compression policy, ancestor filters and replayed layouts to the
+actual child data. Automatic scoring and writing therefore use the same nested
+policy configuration. They can still choose differently because projected
+scoring excludes unsupported candidates or because the bounded sample is not
+representative of the full child stream.
 
 For the same input, target row count and options, split selection is
 deterministic. The full input is encoded against the selected dictionary;

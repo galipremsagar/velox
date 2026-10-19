@@ -28,6 +28,7 @@
 using namespace facebook;
 
 namespace {
+
 constexpr uint32_t commonPrefixSize = 6;
 
 nimble::Encoding::Options bitWidthOptions(bool fixedBitWidthUseExactBits) {
